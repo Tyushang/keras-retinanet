@@ -45,6 +45,7 @@ The default anchor parameters.
 AnchorParameters.default = AnchorParameters(
     sizes   = [32, 64, 128, 256, 512],
     strides = [8, 16, 32, 64, 128],
+    # ratio is y/x or width/height ???
     ratios  = np.array([0.5, 1, 2], tf.keras.backend.floatx()),
     scales  = np.array([2 ** 0, 2 ** (1.0 / 3.0), 2 ** (2.0 / 3.0)], tf.keras.backend.floatx()),
 )
@@ -89,29 +90,31 @@ def anchor_targets_bbox(
     labels_batch      = np.zeros((batch_size, anchors.shape[0], num_classes + 1), dtype=tf.keras.backend.floatx())
 
     # compute labels and regression targets
-    for index, (image, annotations) in enumerate(zip(image_group, annotations_group)):
+    for i_entry, (image, annotations) in enumerate(zip(image_group, annotations_group)):
         if annotations['bboxes'].shape[0]:
             # obtain indices of gt annotations with the greatest overlap
-            positive_indices, ignore_indices, argmax_overlaps_inds = compute_gt_annotations(anchors, annotations['bboxes'], negative_overlap, positive_overlap)
+            positive_indices, ignore_indices, max_box_indices = compute_gt_annotations(
+                anchors, annotations['bboxes'], negative_overlap, positive_overlap)
 
-            labels_batch[index, ignore_indices, -1]       = -1
-            labels_batch[index, positive_indices, -1]     = 1
+            labels_batch[i_entry, ignore_indices, -1]       = -1
+            labels_batch[i_entry, positive_indices, -1]     = 1
 
-            regression_batch[index, ignore_indices, -1]   = -1
-            regression_batch[index, positive_indices, -1] = 1
+            regression_batch[i_entry, ignore_indices, -1]   = -1
+            regression_batch[i_entry, positive_indices, -1] = 1
 
-            # compute target class labels
-            labels_batch[index, positive_indices, annotations['labels'][argmax_overlaps_inds[positive_indices]].astype(int)] = 1
+            # for every positive box, set box's class(one-hot form).
+            labels_positive_max_box = annotations['labels'][max_box_indices[positive_indices]].astype(int)
+            labels_batch[i_entry, positive_indices, labels_positive_max_box] = 1
 
-            regression_batch[index, :, :-1] = bbox_transform(anchors, annotations['bboxes'][argmax_overlaps_inds, :])
+            regression_batch[i_entry, :, :-1] = bbox_transform(anchors, annotations['bboxes'][max_box_indices, :])
 
         # ignore annotations outside of image
         if image.shape:
             anchors_centers = np.vstack([(anchors[:, 0] + anchors[:, 2]) / 2, (anchors[:, 1] + anchors[:, 3]) / 2]).T
             indices = np.logical_or(anchors_centers[:, 0] >= image.shape[1], anchors_centers[:, 1] >= image.shape[0])
 
-            labels_batch[index, indices, -1]     = -1
-            regression_batch[index, indices, -1] = -1
+            labels_batch[i_entry, indices, -1]     = -1
+            regression_batch[i_entry, indices, -1] = -1
 
     return regression_batch, labels_batch
 
@@ -135,14 +138,15 @@ def compute_gt_annotations(
         ignore_indices: indices of ignored anchors
         argmax_overlaps_inds: ordered overlaps indices
     """
-
-    overlaps = compute_overlap(anchors.astype(np.float64), annotations.astype(np.float64))
-    argmax_overlaps_inds = np.argmax(overlaps, axis=1)
-    max_overlaps = overlaps[np.arange(overlaps.shape[0]), argmax_overlaps_inds]
+    # overlaps.shape: [len(anchors), len(annotations)]
+    overlaps     = compute_overlap(anchors.astype(np.float64), annotations.astype(np.float64))
+    # every anchor's max overlap among annotations.
+    max_overlaps = overlaps.max(axis=-1)
 
     # assign "dont care" labels
-    positive_indices = max_overlaps >= positive_overlap
-    ignore_indices = (max_overlaps > negative_overlap) & ~positive_indices
+    positive_indices     = max_overlaps >= positive_overlap
+    ignore_indices       = (max_overlaps > negative_overlap) & ~positive_indices
+    argmax_overlaps_inds = np.argmax(overlaps, axis=-1)
 
     return positive_indices, ignore_indices, argmax_overlaps_inds
 
@@ -251,26 +255,36 @@ def shift(shape, stride, anchors):
         stride : Stride to shift the anchors with over the shape.
         anchors: The anchors to apply at each location.
     """
+    # shift_along_x[i] is anchors that shift along x by (i + 0.5) * stride element-wise.
+    shift_along_x = np.array(list(map(
+        lambda ix: anchors + np.array([1, 0, 1, 0]).reshape((1, 4)) * (ix + 0.5) * stride, range(shape[1])
+    )))
+    # shift_along_y_x[iy][ix] is anchors that shift along y by ((iy + 0.5) * stride) and x by ((ix + 0.5) * stride) element-wise.
+    shift_along_y_x = np.array(list(map(
+        lambda iy: shift_along_x + np.array([0, 1, 0, 1]).reshape((1, 1, 4)) * (iy + 0.5) * stride, range(shape[0])
+    )))
+    all_anchors = shift_along_y_x.reshape(-1, 4)
 
-    # create a grid starting from half stride from the top left corner
-    shift_x = (np.arange(0, shape[1]) + 0.5) * stride
-    shift_y = (np.arange(0, shape[0]) + 0.5) * stride
-
-    shift_x, shift_y = np.meshgrid(shift_x, shift_y)
-
-    shifts = np.vstack((
-        shift_x.ravel(), shift_y.ravel(),
-        shift_x.ravel(), shift_y.ravel()
-    )).transpose()
-
-    # add A anchors (1, A, 4) to
-    # cell K shifts (K, 1, 4) to get
-    # shift anchors (K, A, 4)
-    # reshape to (K*A, 4) shifted anchors
-    A = anchors.shape[0]
-    K = shifts.shape[0]
-    all_anchors = (anchors.reshape((1, A, 4)) + shifts.reshape((1, K, 4)).transpose((1, 0, 2)))
-    all_anchors = all_anchors.reshape((K * A, 4))
+    # Bad implementation!
+    # # create a grid starting from half stride from the top left corner
+    # shift_x = (np.arange(0, shape[1]) + 0.5) * stride
+    # shift_y = (np.arange(0, shape[0]) + 0.5) * stride
+    #
+    # shift_x, shift_y = np.meshgrid(shift_x, shift_y)
+    #
+    # shifts = np.vstack((
+    #     shift_x.ravel(), shift_y.ravel(),
+    #     shift_x.ravel(), shift_y.ravel()
+    # )).transpose()
+    #
+    # # add A anchors (1, A, 4) to
+    # # cell K shifts (K, 1, 4) to get
+    # # shift anchors (K, A, 4)
+    # # reshape to (K*A, 4) shifted anchors
+    # A = anchors.shape[0]
+    # K = shifts.shape[0]
+    # all_anchors = (anchors.reshape((1, A, 4)) + shifts.reshape((1, K, 4)).transpose((1, 0, 2)))
+    # all_anchors = all_anchors.reshape((K * A, 4))
 
     return all_anchors
 
@@ -280,31 +294,35 @@ def generate_anchors(base_size=16, ratios=None, scales=None):
     Generate anchor (reference) windows by enumerating aspect ratios X
     scales w.r.t. a reference window.
     """
-
     if ratios is None:
         ratios = AnchorParameters.default.ratios
-
     if scales is None:
         scales = AnchorParameters.default.scales
+    # ratioed_boxes is centered boxes with specified aspect ratio and area of 1.
+    ratioed_boxes = np.stack(list(map(lambda r: np.array([-1 / 2, -r / 2, 1 / 2, r / 2]) / np.sqrt(r), ratios)))
+    # ratioed_scaled_boxes[i][j] is box that has ratio of ratios[i] and scale of scales[j].
+    ratioed_scaled_boxes = base_size * ratioed_boxes[:, np.newaxis, :] * scales[np.newaxis, :, np.newaxis]
+    anchors = ratioed_scaled_boxes.reshape((-1, 4))
 
-    num_anchors = len(ratios) * len(scales)
-
-    # initialize output anchors
-    anchors = np.zeros((num_anchors, 4))
-
-    # scale base_size
-    anchors[:, 2:] = base_size * np.tile(scales, (2, len(ratios))).T
-
-    # compute areas of anchors
-    areas = anchors[:, 2] * anchors[:, 3]
-
-    # correct for ratios
-    anchors[:, 2] = np.sqrt(areas / np.repeat(ratios, len(scales)))
-    anchors[:, 3] = anchors[:, 2] * np.repeat(ratios, len(scales))
-
-    # transform from (x_ctr, y_ctr, w, h) -> (x1, y1, x2, y2)
-    anchors[:, 0::2] -= np.tile(anchors[:, 2] * 0.5, (2, 1)).T
-    anchors[:, 1::2] -= np.tile(anchors[:, 3] * 0.5, (2, 1)).T
+    # So ugly implementation!!!
+    # num_anchors = len(ratios) * len(scales)
+    #
+    # # initialize output anchors
+    # anchors = np.zeros((num_anchors, 4))
+    #
+    # # scale base_size
+    # anchors[:, 2:] = base_size * np.tile(scales, (2, len(ratios))).T
+    #
+    # # compute areas of anchors
+    # areas = anchors[:, 2] * anchors[:, 3]
+    #
+    # # correct for ratios
+    # anchors[:, 2] = np.sqrt(areas / np.repeat(ratios, len(scales)))
+    # anchors[:, 3] = anchors[:, 2] * np.repeat(ratios, len(scales))
+    #
+    # # transform from (x_ctr, y_ctr, w, h) -> (x1, y1, x2, y2)
+    # anchors[:, 0::2] -= np.tile(anchors[:, 2] * 0.5, (2, 1)).T
+    # anchors[:, 1::2] -= np.tile(anchors[:, 3] * 0.5, (2, 1)).T
 
     return anchors
 
@@ -330,20 +348,21 @@ def bbox_transform(anchors, gt_boxes, mean=None, std=None):
     elif not isinstance(std, np.ndarray):
         raise ValueError('Expected std to be a np.ndarray, list or tuple. Received: {}'.format(type(std)))
 
-    anchor_widths  = anchors[:, 2] - anchors[:, 0]
-    anchor_heights = anchors[:, 3] - anchors[:, 1]
+    w = anchors[:, 2] - anchors[:, 0]
+    h = anchors[:, 3] - anchors[:, 1]
 
     # According to the information provided by a keras-retinanet author, they got marginally better results using
     # the following way of bounding box parametrization.
     # See https://github.com/fizyr/keras-retinanet/issues/1273#issuecomment-585828825 for more details
-    targets_dx1 = (gt_boxes[:, 0] - anchors[:, 0]) / anchor_widths
-    targets_dy1 = (gt_boxes[:, 1] - anchors[:, 1]) / anchor_heights
-    targets_dx2 = (gt_boxes[:, 2] - anchors[:, 2]) / anchor_widths
-    targets_dy2 = (gt_boxes[:, 3] - anchors[:, 3]) / anchor_heights
+    # targets_dx1 = (gt_boxes[:, 0] - anchors[:, 0]) / w
+    # targets_dy1 = (gt_boxes[:, 1] - anchors[:, 1]) / h
+    # targets_dx2 = (gt_boxes[:, 2] - anchors[:, 2]) / w
+    # targets_dy2 = (gt_boxes[:, 3] - anchors[:, 3]) / h
+    #
+    # targets = np.stack((targets_dx1, targets_dy1, targets_dx2, targets_dy2))
+    # targets = targets.T
 
-    targets = np.stack((targets_dx1, targets_dy1, targets_dx2, targets_dy2))
-    targets = targets.T
-
+    targets = (gt_boxes - anchors) / np.stack([w, h, w, h], axis=-1)
     targets = (targets - mean) / std
 
     return targets
