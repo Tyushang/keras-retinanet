@@ -55,10 +55,14 @@ def filter_detections(
         if nms:
             filtered_boxes  = backend.gather_nd(boxes, indices)
             filtered_scores = tf.keras.backend.gather(scores, indices)[:, 0]
-
             # perform NMS
-            nms_indices = backend.non_max_suppression(filtered_boxes, filtered_scores, max_output_size=max_detections, iou_threshold=nms_threshold)
-
+            # nms_indices = backend.non_max_suppression(filtered_boxes, filtered_scores, max_output_size=max_detections, iou_threshold=nms_threshold)
+            nms_indices_padded, n_valid = backend.non_max_suppression_padded(filtered_boxes,
+                                                                             filtered_scores,
+                                                                             max_output_size=max_detections,
+                                                                             iou_threshold=nms_threshold,
+                                                                             pad_to_max_output_size=True)
+            nms_indices = tf.slice(nms_indices_padded, tf.constant([0]), n_valid)
             # filter indices based on NMS
             indices = tf.keras.backend.gather(indices, nms_indices)
 
