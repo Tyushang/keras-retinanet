@@ -57,6 +57,7 @@ def filter_detections(
             filtered_scores = tf.keras.backend.gather(scores, indices)[:, 0]
             # perform NMS
             # nms_indices = backend.non_max_suppression(filtered_boxes, filtered_scores, max_output_size=max_detections, iou_threshold=nms_threshold)
+            # just make a mark to commit.
             nms_indices_padded, n_valid = backend.non_max_suppression_padded(filtered_boxes,
                                                                              filtered_scores,
                                                                              max_output_size=max_detections,
