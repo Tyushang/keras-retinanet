@@ -61,8 +61,9 @@ def filter_detections(
                                                                              filtered_scores,
                                                                              max_output_size=max_detections,
                                                                              iou_threshold=nms_threshold,
+                                                                             score_threshold=score_threshold,
                                                                              pad_to_max_output_size=True)
-            nms_indices = tf.slice(nms_indices_padded, tf.constant([0]), n_valid)
+            nms_indices = tf.slice(nms_indices_padded, tf.constant([0]), [n_valid])
             # filter indices based on NMS
             indices = tf.keras.backend.gather(indices, nms_indices)
 
