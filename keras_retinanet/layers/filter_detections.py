@@ -121,63 +121,67 @@ def filter_detections_tpu(
     nms_threshold         = 0.5
 ):
     """TPU version."""
+
     if other is None:
         other = []
 
     n_anchor, n_class = tf.unstack(tf.shape(classification))
-    # add dummy box or score at the end. invalid indices returned by non_max_suppression_padded will point dummy one.
+    # add dummy box or score at the end. invalid indices will point to the dummy one.
     # shape: [n_anchor + 1, 4]
-    boxes_concat  = tf.concat([boxes, tf.zeros(shape=(1, 4), dtype=boxes.dtype)], axis=0)
+    boxes_with_dummy  = tf.concat([boxes, tf.zeros(shape=(1, 4), dtype=boxes.dtype)], axis=0)
     # shape: [n_anchor + 1, n_class]
-    scores_concat = tf.concat([classification, float('-inf') * tf.ones(shape=(1, n_class))], axis=0)
-    # shape: [d0 + 1, d1, ...]
-    other_concat = [tf.concat([x, [tf.zeros_like(other[0])]], axis=0) for x in other]
+    scores_with_dummy = tf.concat([classification, float('-inf') * tf.ones((1, n_class), classification.dtype)], axis=0)
+    # shape: [n_anchor + 1, ...]
+    other_with_dummy  = [tf.concat([x, [tf.zeros_like(other[0], dtype=x.dtype)]], axis=0) for x in other]
 
-    def _handle_one_entry(scores):
-        # scores shape: [n_anchor + 1, ]
-        if nms:
-            indices_padded, n_valid = backend.non_max_suppression_padded(boxes_concat,
+    def _sort_by_first_arg(args, use_nms=nms):
+        """sort by first arg(shape: [n, ...]), dim0_size of args must be identical cause all args will be sorted."""
+        scores, *others = args
+        dummy_index = tf.shape(scores)[0] - 1
+        if use_nms:
+            indices_padded, n_valid = backend.non_max_suppression_padded(boxes_with_dummy,
                                                                          scores,
                                                                          max_output_size=max_detections,
                                                                          iou_threshold=nms_threshold,
                                                                          score_threshold=score_threshold,
                                                                          pad_to_max_output_size=True)
-            # replace invalid indices to 'n_anchor' which point to dummy one.
-            indices_padded = tf.where(tf.range(max_detections) < n_valid, indices_padded, n_anchor)
+            # replace invalid indices to 'n_anchor' which point to dummy one(last one).
+            indices_padded = tf.where(tf.range(max_detections) < n_valid, indices_padded, dummy_index)
         else:
-            _, indices_padded = tf.nn.top_k(scores, max_detections)
+            topk_scores, indices_padded = tf.nn.top_k(scores, k=max_detections)
+            # replace invalid indices to 'n_anchor' which point to dummy one(last one).
+            indices_padded = tf.where(topk_scores > score_threshold, indices_padded, dummy_index)
 
-        return indices_padded
+        return tuple([tf.gather(x, indices_padded) for x in [scores, *others]])
 
     if class_specific_filter:
-        # shape: [n_class, n_anchors + 1]
-        adapted_scores    = tf.transpose(scores_concat)
-        _, adapted_labels = tf.meshgrid(tf.range(n_anchor + 1), tf.range(n_class))
+        # scores_adapt shape: [n_class, n_anchor + 1], labels shape: [n_class, n_anchor]
+        scores_adapt = tf.transpose(scores_with_dummy)
+        labels       = tf.broadcast_to(tf.range(n_class)[:, tf.newaxis], shape=(n_class, n_anchor))
     else:
-        # shape: [1, n_anchor + 1], after-same.
-        adapted_scores = tf.reshape(tf.reduce_max(scores_concat, axis=1), shape=(1, -1))
-        adapted_labels = tf.reshape(tf.argmax(scores_concat, axis=1, output_type=tf.int32), shape=(1, -1))
+        # scores_adapt shape: [      1, n_anchor + 1], labels shape: [n_class, n_anchor]
+        scores_adapt = tf.reshape(tf.reduce_max(scores_with_dummy, axis=1), shape=(1, -1))
+        labels       = tf.reshape(tf.argmax(classification, axis=1, output_type=tf.int32), shape=(1, -1))
+    # dim0_size: 1 or n_class
+    dim0_size = tf.shape(scores_adapt)[0]
+    # shape: [dim0_size, n_anchor + 1, ...] after-same. add dummy label at the end.
+    labels_adapt = tf.concat([labels, -1 * tf.ones((dim0_size, 1), dtype=labels.dtype)], axis=1)
+    boxes_adapt  = tf.broadcast_to(boxes_with_dummy[tf.newaxis, ...], shape=(dim0_size, *tf.unstack(tf.shape(boxes_with_dummy))))
+    other_adapt  = [tf.broadcast_to(x[tf.newaxis, ...], shape=(dim0_size, *tf.unstack(tf.shape(x)))) for x in other_with_dummy]
 
-    # add dummy label at the end.
-    adapted_labels = tf.where(tf.reshape(tf.range(n_anchor + 1), (1, n_anchor + 1)) < n_anchor, adapted_labels, -1)
-    # shape: [n_class or 1, max_detections], after-same.
-    nms_indices = tf.map_fn(_handle_one_entry, elems=adapted_scores, dtype=tf.int32)
-    _, iy       = tf.meshgrid(tf.range(max_detections), tf.range(tf.shape(nms_indices)[0]))
-    nms_scores  = tf.gather_nd(adapted_scores, tf.stack([iy, nms_indices], axis=-1))
-    nms_labels  = tf.gather_nd(adapted_labels, tf.stack([iy, nms_indices], axis=-1))
-    # shape: [max_detections, ]
-    topk_scores, topk_indices = tf.nn.top_k(tf.reshape(nms_scores, shape=(-1, )), k=max_detections)
-    # top-k indices to anchor indices
-    anchor_indices  = tf.gather(tf.reshape(nms_indices, shape=(-1, )), topk_indices)
-    # lookup nms_labels to get topk_labels.
-    topk_labels = tf.gather(tf.reshape(nms_labels, shape=(-1, )), topk_indices)
-    # lookup boxes_concat/other_concat to get topk_boxes/topk_other.
-    topk_boxes  = tf.gather(boxes_concat, anchor_indices)
-    topk_other  = [tf.gather(x, anchor_indices) for x in other_concat]
+    elems = (scores_adapt, labels_adapt, boxes_adapt, *other_adapt)
+    # shape: [dim0_size, max_detections, ...]
+    res   = tf.map_fn(_sort_by_first_arg, elems=elems, dtype=tuple([x.dtype for x in elems]))
+    # shape: [dim0_size * max_detections, ...], flatten first 2 dimensions.
+    res   = [tf.reshape(x, (tf.shape(x)[0] * tf.shape(x)[1], *tf.unstack(tf.shape(x)[2: ]))) for x in res]
 
-    tf.print(topk_labels)
+    if class_specific_filter:
+        # shape: [max_detections, ...]
+        res = _sort_by_first_arg(res, use_nms=False)
 
-    return [topk_boxes, topk_scores, topk_labels] + topk_other
+    scores_res, labels_res, boxes_res, *other_res = res
+
+    return [boxes_res, scores_res, labels_res] + other_res
 
 
 class FilterDetections(tf.keras.layers.Layer):
@@ -224,14 +228,8 @@ class FilterDetections(tf.keras.layers.Layer):
 
         # wrap nms with our parameters
         def _filter_detections(args):
-            boxes          = args[0]
-            classification = args[1]
-            other          = args[2]
-
             return filter_detections_tpu(
-                boxes,
-                classification,
-                other,
+                args[0], args[1], args[2],
                 nms                   = self.nms,
                 class_specific_filter = self.class_specific_filter,
                 score_threshold       = self.score_threshold,
