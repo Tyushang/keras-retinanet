@@ -56,15 +56,7 @@ def filter_detections(
             filtered_boxes  = backend.gather_nd(boxes, indices)
             filtered_scores = tf.keras.backend.gather(scores, indices)[:, 0]
             # perform NMS
-            # nms_indices = backend.non_max_suppression(filtered_boxes, filtered_scores, max_output_size=max_detections, iou_threshold=nms_threshold)
-            # just make a mark to commit.
-            nms_indices_padded, n_valid = backend.non_max_suppression_padded(filtered_boxes,
-                                                                             filtered_scores,
-                                                                             max_output_size=max_detections,
-                                                                             iou_threshold=nms_threshold,
-                                                                             score_threshold=score_threshold,
-                                                                             pad_to_max_output_size=True)
-            nms_indices = tf.slice(nms_indices_padded, tf.constant([0]), [n_valid])
+            nms_indices = backend.non_max_suppression(filtered_boxes, filtered_scores, max_output_size=max_detections, iou_threshold=nms_threshold)
             # filter indices based on NMS
             indices = tf.keras.backend.gather(indices, nms_indices)
 
@@ -118,6 +110,76 @@ def filter_detections(
     return [boxes, scores, labels] + other_
 
 
+def filter_detections_tpu(
+    boxes,
+    classification,
+    other                 = None,
+    class_specific_filter = True,
+    nms                   = True,
+    score_threshold       = 0.05,
+    max_detections        = 300,
+    nms_threshold         = 0.5
+):
+    """TPU version."""
+    if other is None:
+        other = []
+
+    n_anchor, n_class = tf.unstack(tf.shape(classification))
+    # add dummy box or score at the end. invalid indices returned by non_max_suppression_padded will point dummy one.
+    # shape: [n_anchor + 1, 4]
+    boxes_concat  = tf.concat([boxes, tf.zeros(shape=(1, 4), dtype=boxes.dtype)], axis=0)
+    # shape: [n_anchor + 1, n_class]
+    scores_concat = tf.concat([classification, float('-inf') * tf.ones(shape=(1, n_class))], axis=0)
+    # shape: [d0 + 1, d1, ...]
+    other_concat = [tf.concat([x, [tf.zeros_like(other[0])]], axis=0) for x in other]
+
+    def _handle_one_entry(scores):
+        # scores shape: [n_anchor + 1, ]
+        if nms:
+            indices_padded, n_valid = backend.non_max_suppression_padded(boxes_concat,
+                                                                         scores,
+                                                                         max_output_size=max_detections,
+                                                                         iou_threshold=nms_threshold,
+                                                                         score_threshold=score_threshold,
+                                                                         pad_to_max_output_size=True)
+            # replace invalid indices to 'n_anchor' which point to dummy one.
+            indices_padded = tf.where(tf.range(max_detections) < n_valid, indices_padded, n_anchor)
+        else:
+            _, indices_padded = tf.nn.top_k(scores, max_detections)
+
+        return indices_padded
+
+    if class_specific_filter:
+        # shape: [n_class, n_anchors + 1]
+        adapted_scores    = tf.transpose(scores_concat)
+        _, adapted_labels = tf.meshgrid(tf.range(n_anchor + 1), tf.range(n_class))
+    else:
+        # shape: [1, n_anchor + 1], after-same.
+        adapted_scores = tf.reshape(tf.reduce_max(scores_concat, axis=1), shape=(1, -1))
+        adapted_labels = tf.reshape(tf.argmax(scores_concat, axis=1, output_type=tf.int32), shape=(1, -1))
+
+    # add dummy label at the end.
+    adapted_labels = tf.where(tf.reshape(tf.range(n_anchor + 1), (1, n_anchor + 1)) < n_anchor, adapted_labels, -1)
+    # shape: [n_class or 1, max_detections], after-same.
+    nms_indices = tf.map_fn(_handle_one_entry, elems=adapted_scores, dtype=tf.int32)
+    _, iy       = tf.meshgrid(tf.range(max_detections), tf.range(tf.shape(nms_indices)[0]))
+    nms_scores  = tf.gather_nd(adapted_scores, tf.stack([iy, nms_indices], axis=-1))
+    nms_labels  = tf.gather_nd(adapted_labels, tf.stack([iy, nms_indices], axis=-1))
+    # shape: [max_detections, ]
+    topk_scores, topk_indices = tf.nn.top_k(tf.reshape(nms_scores, shape=(-1, )), k=max_detections)
+    # top-k indices to anchor indices
+    anchor_indices  = tf.gather(tf.reshape(nms_indices, shape=(-1, )), topk_indices)
+    # lookup nms_labels to get topk_labels.
+    topk_labels = tf.gather(tf.reshape(nms_labels, shape=(-1, )), topk_indices)
+    # lookup boxes_concat/other_concat to get topk_boxes/topk_other.
+    topk_boxes  = tf.gather(boxes_concat, anchor_indices)
+    topk_other  = [tf.gather(x, anchor_indices) for x in other_concat]
+
+    tf.print(topk_labels)
+
+    return [topk_boxes, topk_scores, topk_labels] + topk_other
+
+
 class FilterDetections(tf.keras.layers.Layer):
     """ Keras layer for filtering detections using score threshold and NMS.
     """
@@ -166,7 +228,7 @@ class FilterDetections(tf.keras.layers.Layer):
             classification = args[1]
             other          = args[2]
 
-            return filter_detections(
+            return filter_detections_tpu(
                 boxes,
                 classification,
                 other,
