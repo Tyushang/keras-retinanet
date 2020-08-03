@@ -125,14 +125,14 @@ def filter_detections_tpu(
     if other is None:
         other = []
 
-    n_anchor, n_class = tf.unstack(tf.shape(classification))
+    n_anchor, n_class = tf.unstack(tf.shape(classification), name='tyu_fd_unstack128')
     # add dummy box or score at the end. invalid indices will point to the dummy one.
     # shape: [n_anchor + 1, 4]
-    boxes_with_dummy  = tf.concat([boxes, tf.zeros(shape=(1, 4), dtype=boxes.dtype)], axis=0)
+    boxes_with_dummy  = tf.concat([boxes, tf.zeros(shape=(1, 4), dtype=boxes.dtype)], axis=0, name='tyu_fd_concat131')
     # shape: [n_anchor + 1, n_class]
-    scores_with_dummy = tf.concat([classification, float('-inf') * tf.ones((1, n_class), classification.dtype)], axis=0)
+    scores_with_dummy = tf.concat([classification, float('-inf') * tf.ones((1, n_class), classification.dtype)], axis=0, name='tyu_fd_concat133')
     # shape: [n_anchor + 1, ...]
-    other_with_dummy  = [tf.concat([x, [tf.zeros_like(other[0], dtype=x.dtype)]], axis=0) for x in other]
+    # other_with_dummy  = [tf.concat([x, [tf.zeros_like(other[0], dtype=x.dtype)]], axis=0) for x in other]
 
     def _sort_by_first_arg(args, use_nms=nms):
         """sort by first arg(shape: [n, ...]), dim0_size of args must be identical cause all args will be sorted."""
@@ -146,11 +146,11 @@ def filter_detections_tpu(
                                                                          score_threshold=score_threshold,
                                                                          pad_to_max_output_size=True)
             # replace invalid indices to 'n_anchor' which point to dummy one(last one).
-            indices_padded = tf.where(tf.range(max_detections) < n_valid, indices_padded, dummy_index)
+            indices_padded = tf.where(tf.range(max_detections) < n_valid, indices_padded, dummy_index, name='tyu_fd_where149')
         else:
             topk_scores, indices_padded = tf.nn.top_k(scores, k=max_detections)
             # replace invalid indices to 'n_anchor' which point to dummy one(last one).
-            indices_padded = tf.where(topk_scores > score_threshold, indices_padded, dummy_index)
+            indices_padded = tf.where(topk_scores > score_threshold, indices_padded, dummy_index, name='tyu_fd_153')
 
         return tuple([tf.gather(x, indices_padded) for x in [scores, *others]])
 
@@ -159,7 +159,7 @@ def filter_detections_tpu(
         scores_adapt = tf.transpose(scores_with_dummy)
         labels       = tf.broadcast_to(tf.range(n_class)[:, tf.newaxis], shape=(n_class, n_anchor))
     else:
-        # scores_adapt shape: [      1, n_anchor + 1], labels shape: [n_class, n_anchor]
+        # scores_adapt shape: [      1, n_anchor + 1], labels shape: [      1, n_anchor]
         scores_adapt = tf.reshape(tf.reduce_max(scores_with_dummy, axis=1), shape=(1, -1))
         labels       = tf.reshape(tf.argmax(classification, axis=1, output_type=tf.int32), shape=(1, -1))
     # dim0_size: 1 or n_class
@@ -167,11 +167,11 @@ def filter_detections_tpu(
     # shape: [dim0_size, n_anchor + 1, ...] after-same. add dummy label at the end.
     labels_adapt = tf.concat([labels, -1 * tf.ones((dim0_size, 1), dtype=labels.dtype)], axis=1)
     boxes_adapt  = tf.broadcast_to(boxes_with_dummy[tf.newaxis, ...], shape=(dim0_size, *tf.unstack(tf.shape(boxes_with_dummy))))
-    other_adapt  = [tf.broadcast_to(x[tf.newaxis, ...], shape=(dim0_size, *tf.unstack(tf.shape(x)))) for x in other_with_dummy]
+    # other_adapt  = [tf.broadcast_to(x[tf.newaxis, ...], shape=(dim0_size, *tf.unstack(tf.shape(x)))) for x in other_with_dummy]
 
-    elems = (scores_adapt, labels_adapt, boxes_adapt, *other_adapt)
+    elems = (scores_adapt, labels_adapt, boxes_adapt)  # , *other_adapt)
     # shape: [dim0_size, max_detections, ...]
-    res   = tf.map_fn(_sort_by_first_arg, elems=elems, dtype=tuple([x.dtype for x in elems]))
+    res   = tf.map_fn(_sort_by_first_arg, elems=elems, dtype=tuple([x.dtype for x in elems]), name='tyu_fd_map174')
     # shape: [dim0_size * max_detections, ...], flatten first 2 dimensions.
     res   = [tf.reshape(x, (tf.shape(x)[0] * tf.shape(x)[1], *tf.unstack(tf.shape(x)[2: ]))) for x in res]
 
@@ -180,8 +180,11 @@ def filter_detections_tpu(
         res = _sort_by_first_arg(res, use_nms=False)
 
     scores_res, labels_res, boxes_res, *other_res = res
+    scores_res.set_shape(shape=(max_detections, ))
+    labels_res.set_shape(shape=(max_detections, ))
+    boxes_res.set_shape(shape=(max_detections, 4))
 
-    return [boxes_res, scores_res, labels_res] + other_res
+    return tuple([boxes_res, scores_res, labels_res]) # + other_res)
 
 
 class FilterDetections(tf.keras.layers.Layer):
@@ -222,14 +225,18 @@ class FilterDetections(tf.keras.layers.Layer):
         Args
             inputs : List of [boxes, classification, other[0], other[1], ...] tensors.
         """
-        boxes          = inputs[0]
-        classification = inputs[1]
-        other          = inputs[2:]
+        boxes, classification, *other = inputs
+
+        boxes = tf.identity(boxes, name='tyu_fd_id227')
+        classification = tf.identity(classification, name='tyu_fd_id228')
 
         # wrap nms with our parameters
         def _filter_detections(args):
+            b, c = args
+            b = tf.identity(b, name='tyu_fd_id233')
+            c = tf.identity(c, name='tyu_fd_id234')
             return filter_detections_tpu(
-                args[0], args[1], args[2],
+                b, c, None,
                 nms                   = self.nms,
                 class_specific_filter = self.class_specific_filter,
                 score_threshold       = self.score_threshold,
@@ -238,11 +245,12 @@ class FilterDetections(tf.keras.layers.Layer):
             )
 
         # call filter_detections on each batch
-        outputs = backend.map_fn(
+        outputs = tf.map_fn(
             _filter_detections,
-            elems=[boxes, classification, other],
-            dtype=[tf.keras.backend.floatx(), tf.keras.backend.floatx(), 'int32'] + [o.dtype for o in other],
-            parallel_iterations=self.parallel_iterations
+            elems=(boxes, classification),
+            dtype=(tf.float32, tf.float32, tf.int32), # tuple([] + [o.dtype for o in other]),
+            # parallel_iterations=self.parallel_iterations,
+            name='tyu_fd_map_fn246'
         )
 
         return outputs

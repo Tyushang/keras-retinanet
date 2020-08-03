@@ -53,7 +53,7 @@ def clip_by_value(*args, **kwargs):
     return tensorflow.clip_by_value(*args, **kwargs)
 
 
-def resize_images(images, size, method='bilinear', align_corners=False):
+def resize_images(images, size, method='bilinear', align_corners=True):
     """ See https://www.tensorflow.org/versions/r1.14/api_docs/python/tf/image/resize_images .
 
     Args
@@ -65,7 +65,7 @@ def resize_images(images, size, method='bilinear', align_corners=False):
         'bicubic' : tensorflow.image.ResizeMethod.BICUBIC,
         'area'    : tensorflow.image.ResizeMethod.AREA,
     }
-    return tensorflow.compat.v1.image.resize_images(images, size, methods[method], align_corners)
+    return tensorflow.compat.v1.image.resize_images(images, size, methods[method], align_corners, name='tyu_resize_images')
 
 
 def non_max_suppression(*args, **kwargs):

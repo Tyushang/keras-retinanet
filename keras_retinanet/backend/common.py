@@ -52,6 +52,29 @@ def bbox_transform_inv(boxes, deltas, mean=None, std=None):
     return pred_boxes
 
 
+def bbox_transform_inv_tpu(boxes, deltas, mean=None, std=None):
+    """TPU version."""
+    # boxes & deltas shape: [B, N, 4]
+    B, N, *_ = tf.unstack(tf.shape(boxes))
+
+    if mean is None:
+        mean = [0.0, 0.0, 0.0, 0.0]
+    if std is None:
+        std  = [0.2, 0.2, 0.2, 0.2]
+    mean = tf.broadcast_to(tf.convert_to_tensor(mean, dtype=tf.float32), shape=(B, N, 4))
+    std  = tf.broadcast_to(tf.convert_to_tensor(std,  dtype=tf.float32), shape=(B, N, 4))
+
+    # shape: [B, N]
+    w = tf.subtract(boxes[:, :, 2], boxes[:, :, 0], name='tyu_subtract_w')
+    h = tf.subtract(boxes[:, :, 3], boxes[:, :, 1], name='tyu_subtract_h')
+    # shape: [B, N, 4]
+    whwh = tf.stack([w, h, w, h], axis=-1)
+    # boxes + (deltas * std + mean) * hwhw
+    pred_boxes = tf.add_n([boxes, deltas * std * whwh, mean * whwh], name='tyu_bbox_transform_inv_tpu')
+
+    return pred_boxes
+
+
 def shift(shape, stride, anchors):
     """ Produce shifted anchors based on shape of the map and stride size.
 

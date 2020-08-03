@@ -102,11 +102,11 @@ class UpsampleLike(tf.keras.layers.Layer):
         target_shape = tf.keras.backend.shape(target)
         if tf.keras.backend.image_data_format() == 'channels_first':
             source = backend.transpose(source, (0, 2, 3, 1))
-            output = backend.resize_images(source, (target_shape[2], target_shape[3]), method='nearest')
+            output = backend.resize_images(source, (target_shape[2], target_shape[3]), method='bilinear')
             output = backend.transpose(output, (0, 3, 1, 2))
             return output
         else:
-            return backend.resize_images(source, (target_shape[1], target_shape[2]), method='nearest')
+            return backend.resize_images(source, (target_shape[1], target_shape[2]), method='bilinear')
 
     def compute_output_shape(self, input_shape):
         if tf.keras.backend.image_data_format() == 'channels_first':
@@ -157,6 +157,44 @@ class RegressBoxes(tf.keras.layers.Layer):
         config.update({
             'mean': self.mean.tolist(),
             'std' : self.std.tolist(),
+        })
+
+        return config
+
+
+class RegressBoxesTPU(tf.keras.layers.Layer):
+    """ Keras layer for applying regression values to boxes.
+    """
+
+    def __init__(self, mean=None, std=None, *args, **kwargs):
+        """ Initializer for the RegressBoxes layer.
+
+        Args
+            mean: The mean value of the regression values which was used for normalization.
+            std: The standard value of the regression values which was used for normalization.
+        """
+        if mean is None:
+            mean = [0.0, 0.0, 0.0, 0.0]
+        if std is None:
+            std  = [0.2, 0.2, 0.2, 0.2]
+
+        self.mean = mean
+        self.std  = std
+
+        super(RegressBoxesTPU, self).__init__(*args, **kwargs)
+
+    def call(self, inputs, **kwargs):
+        anchors, regression = inputs
+        return backend.bbox_transform_inv_tpu(anchors, regression, mean=self.mean, std=self.std)
+
+    def compute_output_shape(self, input_shape):
+        return input_shape[0]
+
+    def get_config(self):
+        config = super(RegressBoxesTPU, self).get_config()
+        config.update({
+            'mean': self.mean,
+            'std' : self.std,
         })
 
         return config
