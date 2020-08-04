@@ -134,25 +134,36 @@ def filter_detections_tpu(
     # shape: [n_anchor + 1, ...]
     # other_with_dummy  = [tf.concat([x, [tf.zeros_like(other[0], dtype=x.dtype)]], axis=0) for x in other]
 
-    def _sort_by_first_arg(args, use_nms=nms):
+    def _sort_by_1st_arg(args, use_nms, output_size):
         """sort by first arg(shape: [n, ...]), dim0_size of args must be identical cause all args will be sorted."""
         scores, *others = args
         dummy_index = tf.shape(scores)[0] - 1
         if use_nms:
             indices_padded, n_valid = backend.non_max_suppression_padded(boxes_with_dummy,
                                                                          scores,
-                                                                         max_output_size=max_detections,
+                                                                         max_output_size=output_size,
                                                                          iou_threshold=nms_threshold,
                                                                          score_threshold=score_threshold,
                                                                          pad_to_max_output_size=True)
             # replace invalid indices to 'n_anchor' which point to dummy one(last one).
             indices_padded = tf.where(tf.range(max_detections) < n_valid, indices_padded, dummy_index, name='tyu_fd_where149')
         else:
-            topk_scores, indices_padded = tf.nn.top_k(scores, k=max_detections)
+            topk_scores, indices_padded = tf.nn.top_k(scores, k=output_size)
             # replace invalid indices to 'n_anchor' which point to dummy one(last one).
             indices_padded = tf.where(topk_scores > score_threshold, indices_padded, dummy_index, name='tyu_fd_153')
 
         return tuple([tf.gather(x, indices_padded) for x in [scores, *others]])
+
+    def _pre_exclude(args):
+        """pre-exclude those with low scores, using top-k method, to reduce memory usage."""
+        return _sort_by_1st_arg(args, use_nms=False, output_size=(2 * max_detections))
+
+    def _sort_by_1st_arg_using_topk(args):
+        return _sort_by_1st_arg(args, use_nms=False, output_size=max_detections)
+
+    def _sort_by_1st_arg_using_nms(args):
+        return _sort_by_1st_arg(args, use_nms=True, output_size=max_detections)
+
 
     if class_specific_filter:
         # scores_adapt shape: [n_class, n_anchor + 1], labels shape: [n_class, n_anchor]
@@ -169,15 +180,18 @@ def filter_detections_tpu(
     boxes_adapt  = tf.broadcast_to(boxes_with_dummy[tf.newaxis, ...], shape=(dim0_size, *tf.unstack(tf.shape(boxes_with_dummy))))
     # other_adapt  = [tf.broadcast_to(x[tf.newaxis, ...], shape=(dim0_size, *tf.unstack(tf.shape(x)))) for x in other_with_dummy]
 
+    func  = _sort_by_1st_arg_using_nms if nms else _sort_by_1st_arg_using_topk
     elems = (scores_adapt, labels_adapt, boxes_adapt)  # , *other_adapt)
+    # pre-exclude to reduce memory usage.
+    res   = tf.map_fn(_pre_exclude, elems=elems, dtype=tuple([x.dtype for x in elems]), name='tyu_fd_map174')
     # shape: [dim0_size, max_detections, ...]
-    res   = tf.map_fn(_sort_by_first_arg, elems=elems, dtype=tuple([x.dtype for x in elems]), name='tyu_fd_map174')
+    res   = tf.map_fn(func, elems=elems, dtype=tuple([x.dtype for x in res]), name='tyu_fd_map174')
     # shape: [dim0_size * max_detections, ...], flatten first 2 dimensions.
     res   = [tf.reshape(x, (tf.shape(x)[0] * tf.shape(x)[1], *tf.unstack(tf.shape(x)[2: ]))) for x in res]
 
     if class_specific_filter:
         # shape: [max_detections, ...]
-        res = _sort_by_first_arg(res, use_nms=False)
+        res = _sort_by_1st_arg_using_topk(res)
 
     scores_res, labels_res, boxes_res, *other_res = res
     scores_res.set_shape(shape=(max_detections, ))
@@ -226,8 +240,9 @@ class FilterDetections(tf.keras.layers.Layer):
             inputs : List of [boxes, classification, other[0], other[1], ...] tensors.
         """
         boxes, classification, *other = inputs
-
+        # shape: [B, N, 4]
         boxes = tf.identity(boxes, name='tyu_fd_id227')
+        # shape: [B, N]
         classification = tf.identity(classification, name='tyu_fd_id228')
 
         # wrap nms with our parameters

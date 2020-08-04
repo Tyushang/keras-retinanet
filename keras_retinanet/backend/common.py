@@ -61,8 +61,9 @@ def bbox_transform_inv_tpu(boxes, deltas, mean=None, std=None):
         mean = [0.0, 0.0, 0.0, 0.0]
     if std is None:
         std  = [0.2, 0.2, 0.2, 0.2]
-    mean = tf.broadcast_to(tf.convert_to_tensor(mean, dtype=tf.float32), shape=(B, N, 4))
-    std  = tf.broadcast_to(tf.convert_to_tensor(std,  dtype=tf.float32), shape=(B, N, 4))
+    # TODO: shape: [4, ], tf.broadcast_to() not compatible to TPU, don't know why?
+    mean = tf.convert_to_tensor(mean, dtype=tf.float32, name='tyu_mean') # tf.broadcast_to(, shape=(B, N, 4))
+    std  = tf.convert_to_tensor(std , dtype=tf.float32, name='tyu_std') # tf.broadcast_to(, shape=(B, N, 4))
 
     # shape: [B, N]
     w = tf.subtract(boxes[:, :, 2], boxes[:, :, 0], name='tyu_subtract_w')
