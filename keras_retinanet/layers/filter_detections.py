@@ -134,13 +134,12 @@ def filter_detections_tpu(
     # shape: [n_anchor + 1, ...]
     # other_with_dummy  = [tf.concat([x, [tf.zeros_like(other[0], dtype=x.dtype)]], axis=0) for x in other]
 
-    def _sort_by_1st_arg(args, use_nms, output_size):
-        """sort by first arg(shape: [n, ...]), dim0_size of args must be identical cause all args will be sorted."""
-        scores, *others = args
+    def _sort_by_scores(scores, others, output_size, use_nms=False):
+        """sort by scores, dim0_size of scores and *others must be identical cause all will be sorted."""
         dummy_index = tf.shape(scores)[0] - 1
         if use_nms:
-            indices_padded, n_valid = backend.non_max_suppression_padded(boxes_with_dummy,
-                                                                         scores,
+            boxes = others[0]
+            indices_padded, n_valid = backend.non_max_suppression_padded(boxes, scores,
                                                                          max_output_size=output_size,
                                                                          iou_threshold=nms_threshold,
                                                                          score_threshold=score_threshold,
@@ -156,14 +155,16 @@ def filter_detections_tpu(
 
     def _pre_exclude(args):
         """pre-exclude those with low scores, using top-k method, to reduce memory usage."""
-        return _sort_by_1st_arg(args, use_nms=False, output_size=(2 * max_detections))
+        scores, *others = args
+        return _sort_by_scores(scores, others, output_size=(max_detections * 2), use_nms=False)
 
     def _sort_by_1st_arg_using_topk(args):
-        return _sort_by_1st_arg(args, use_nms=False, output_size=max_detections)
+        scores, *others = args
+        return _sort_by_scores(scores, others, output_size=max_detections, use_nms=False)
 
     def _sort_by_1st_arg_using_nms(args):
-        return _sort_by_1st_arg(args, use_nms=True, output_size=max_detections)
-
+        scores, *others = args
+        return _sort_by_scores(scores, others, output_size=max_detections, use_nms=True)
 
     if class_specific_filter:
         # scores_adapt shape: [n_class, n_anchor + 1], labels shape: [n_class, n_anchor]
@@ -181,7 +182,7 @@ def filter_detections_tpu(
     # other_adapt  = [tf.broadcast_to(x[tf.newaxis, ...], shape=(dim0_size, *tf.unstack(tf.shape(x)))) for x in other_with_dummy]
 
     func  = _sort_by_1st_arg_using_nms if nms else _sort_by_1st_arg_using_topk
-    elems = (scores_adapt, labels_adapt, boxes_adapt)  # , *other_adapt)
+    elems = (scores_adapt, boxes_adapt, labels_adapt, )  # , *other_adapt)
     # pre-exclude to reduce memory usage.
     res   = tf.map_fn(_pre_exclude, elems=elems, dtype=tuple([x.dtype for x in elems]), name='tyu_fd_map174')
     # shape: [dim0_size, max_detections, ...]
@@ -193,10 +194,10 @@ def filter_detections_tpu(
         # shape: [max_detections, ...]
         res = _sort_by_1st_arg_using_topk(res)
 
-    scores_res, labels_res, boxes_res, *other_res = res
+    scores_res, boxes_res, labels_res, *other_res = res
     scores_res.set_shape(shape=(max_detections, ))
-    labels_res.set_shape(shape=(max_detections, ))
     boxes_res.set_shape(shape=(max_detections, 4))
+    labels_res.set_shape(shape=(max_detections, ))
 
     return tuple([boxes_res, scores_res, labels_res]) # + other_res)
 
