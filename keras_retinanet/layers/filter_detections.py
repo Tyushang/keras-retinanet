@@ -110,6 +110,110 @@ def filter_detections(
     return [boxes, scores, labels] + other_
 
 
+class FilterDetections(tf.keras.layers.Layer):
+    """ Keras layer for filtering detections using score threshold and NMS.
+    """
+
+    def __init__(
+        self,
+        nms                   = True,
+        class_specific_filter = True,
+        nms_threshold         = 0.5,
+        score_threshold       = 0.05,
+        max_detections        = 300,
+        parallel_iterations   = 32,
+        **kwargs
+    ):
+        """ Filters detections using score threshold, NMS and selecting the top-k detections.
+
+        Args
+            nms                   : Flag to enable/disable NMS.
+            class_specific_filter : Whether to perform filtering per class, or take the best scoring class and filter those.
+            nms_threshold         : Threshold for the IoU value to determine when a box should be suppressed.
+            score_threshold       : Threshold used to prefilter the boxes with.
+            max_detections        : Maximum number of detections to keep.
+            parallel_iterations   : Number of batch items to process in parallel.
+        """
+        self.nms                   = nms
+        self.class_specific_filter = class_specific_filter
+        self.nms_threshold         = nms_threshold
+        self.score_threshold       = score_threshold
+        self.max_detections        = max_detections
+        self.parallel_iterations   = parallel_iterations
+        super(FilterDetections, self).__init__(**kwargs)
+
+    def call(self, inputs, **kwargs):
+        """ Constructs the NMS graph.
+
+        Args
+            inputs : List of [boxes, classification, other[0], other[1], ...] tensors.
+        """
+        boxes, classification, *other = inputs
+
+        # wrap nms with our parameters
+        def _filter_detections(args):
+            b, c, o = args
+            return filter_detections(
+                b, c, o,
+                nms                   = self.nms,
+                class_specific_filter = self.class_specific_filter,
+                score_threshold       = self.score_threshold,
+                max_detections        = self.max_detections,
+                nms_threshold         = self.nms_threshold,
+            )
+
+        # call filter_detections on each batch
+        outputs = tf.map_fn(
+            _filter_detections,
+            elems=(boxes, classification, other),
+            dtype=[tf.float32, tf.float32, tf.int32] + [o.dtype for o in other],
+            parallel_iterations=self.parallel_iterations,
+        )
+
+        return outputs
+
+    def compute_output_shape(self, input_shape):
+        """ Computes the output shapes given the input shapes.
+
+        Args
+            input_shape : List of input shapes [boxes, classification, other[0], other[1], ...].
+
+        Returns
+            List of tuples representing the output shapes:
+            [filtered_boxes.shape, filtered_scores.shape, filtered_labels.shape, filtered_other[0].shape, filtered_other[1].shape, ...]
+        """
+        return [
+            (input_shape[0][0], self.max_detections, 4),
+            (input_shape[1][0], self.max_detections),
+            (input_shape[1][0], self.max_detections),
+        ] + [
+            tuple([input_shape[i][0], self.max_detections] + list(input_shape[i][2:])) for i in range(2, len(input_shape))
+        ]
+
+    def compute_mask(self, inputs, mask=None):
+        """ This is required in Keras when there is more than 1 output.
+        """
+        return (len(inputs) + 1) * [None]
+
+    def get_config(self):
+        """ Gets the configuration of this layer.
+
+        Returns
+            Dictionary containing the parameters of this layer.
+        """
+        config = super(FilterDetections, self).get_config()
+        config.update({
+            'nms'                   : self.nms,
+            'class_specific_filter' : self.class_specific_filter,
+            'nms_threshold'         : self.nms_threshold,
+            'score_threshold'       : self.score_threshold,
+            'max_detections'        : self.max_detections,
+            'parallel_iterations'   : self.parallel_iterations,
+        })
+
+        return config
+
+
 def filter_detections_tpu(
     boxes,
     classification,
@@ -202,7 +306,7 @@ def filter_detections_tpu(
     return tuple([boxes_res, scores_res, labels_res]) # + other_res)
 
 
-class FilterDetections(tf.keras.layers.Layer):
+class FilterDetectionsTPU(tf.keras.layers.Layer):
     """ Keras layer for filtering detections using score threshold and NMS.
     """
 
@@ -232,7 +336,7 @@ class FilterDetections(tf.keras.layers.Layer):
         self.score_threshold       = score_threshold
         self.max_detections        = max_detections
         self.parallel_iterations   = parallel_iterations
-        super(FilterDetections, self).__init__(**kwargs)
+        super(FilterDetectionsTPU, self).__init__(**kwargs)
 
     def call(self, inputs, **kwargs):
         """ Constructs the NMS graph.
@@ -300,7 +404,7 @@ class FilterDetections(tf.keras.layers.Layer):
         Returns
             Dictionary containing the parameters of this layer.
         """
-        config = super(FilterDetections, self).get_config()
+        config = super(FilterDetectionsTPU, self).get_config()
         config.update({
             'nms'                   : self.nms,
             'class_specific_filter' : self.class_specific_filter,
