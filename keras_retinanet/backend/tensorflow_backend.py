@@ -53,7 +53,7 @@ def clip_by_value(*args, **kwargs):
     return tensorflow.clip_by_value(*args, **kwargs)
 
 
-def resize_images(images, size, method='bilinear', align_corners=True):
+def resize_images(images, size, method='bilinear', align_corners=False):
     """ See https://www.tensorflow.org/versions/r1.14/api_docs/python/tf/image/resize_images .
 
     Args
